@@ -254,8 +254,12 @@ def _linux_ask(req: Ask, channel: str) -> Result:
         cp = _zenity(["zenity", "--entry", "--title", req.title,
                       "--text", req.message, "--entry-text", req.default], req)
     elif shutil.which("kdialog"):
-        cp = subprocess.run(["kdialog", "--title", req.title, "--inputbox", req.message, req.default],
-                            capture_output=True, text=True)
+        try:                                                # kdialog has no --timeout; kill it ourselves
+            cp = subprocess.run(["kdialog", "--title", req.title, "--inputbox", req.message, req.default],
+                                capture_output=True, text=True,
+                                timeout=(req.timeout if req.has_timeout() else None))
+        except subprocess.TimeoutExpired:
+            return Result("timeout", channel, "ask")
     else:
         raise Unsupported("no zenity/kdialog found for interactive prompts on Linux")
     if cp.returncode == 5:                                  # zenity timeout
@@ -270,8 +274,12 @@ def _linux_confirm(req: Ask, channel: str) -> Result:
         cp = _zenity(["zenity", "--question", "--title", req.title, "--text", req.message,
                       "--ok-label", req.yes, "--cancel-label", req.no], req)
     elif shutil.which("kdialog"):
-        cp = subprocess.run(["kdialog", "--title", req.title, "--yesno", req.message],
-                            capture_output=True, text=True)
+        try:                                                # kdialog has no --timeout; kill it ourselves
+            cp = subprocess.run(["kdialog", "--title", req.title, "--yesno", req.message],
+                                capture_output=True, text=True,
+                                timeout=(req.timeout if req.has_timeout() else None))
+        except subprocess.TimeoutExpired:
+            return Result("timeout", channel, "confirm")
     else:
         raise Unsupported("no zenity/kdialog found for interactive prompts on Linux")
     if cp.returncode == 5:
@@ -300,27 +308,39 @@ def _linux_choose(req: Ask, channel: str) -> Result:
 # Windows system backend (PowerShell / WScript.Shell), best effort
 # --------------------------------------------------------------------------- #
 
-def _powershell(script: str, timeout: Optional[float] = None) -> subprocess.CompletedProcess:
+def _powershell(script: str, timeout: Optional[float] = None,
+                env: Optional[dict] = None) -> subprocess.CompletedProcess:
+    # `script` is always a fixed string literal we control. Any agent-supplied
+    # text (message/title/default) must come in through `env` and be read inside
+    # the script as `$env:VAR`, NEVER interpolated into `script`: PowerShell
+    # evaluates $(...) subexpressions, $vars, and backticks while expanding a
+    # double-quoted string literal, so interpolating untrusted text there is a
+    # command-injection hole. `$env:VAR` yields the raw value with no re-parse.
+    full_env = None
+    if env:
+        full_env = dict(os.environ)
+        full_env.update({k: ("" if v is None else str(v)) for k, v in env.items()})
     return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                          capture_output=True, text=True, timeout=timeout)
+                          capture_output=True, text=True, timeout=timeout, env=full_env)
 
 
 def _win_notify(req: Ask, channel: str) -> Result:
-    wait = 15 if req.urgency == "high" else 5
-    msg, title = req.message.replace('"', "'"), req.title.replace('"', "'")
-    script = f'(New-Object -ComObject WScript.Shell).Popup("{msg}", {wait}, "{title}", 64) | Out-Null'
-    cp = _powershell(script)
+    wait = 15 if req.urgency == "high" else 5   # int we control; safe to interpolate
+    script = (f'(New-Object -ComObject WScript.Shell).Popup('
+              f'[string]$env:AP_MSG, {wait}, [string]$env:AP_TITLE, 64) | Out-Null')
+    cp = _powershell(script, env={"AP_MSG": req.message, "AP_TITLE": req.title})
     if cp.returncode != 0:
         return Result("error", channel, "notify", error=(cp.stderr or "").strip() or "powershell failed")
     return Result("delivered", channel, "notify")
 
 
 def _win_ask(req: Ask, channel: str) -> Result:
-    msg, title, dflt = (s.replace('"', "'") for s in (req.message, req.title, req.default))
     script = ('Add-Type -AssemblyName Microsoft.VisualBasic;'
-              f'[Microsoft.VisualBasic.Interaction]::InputBox("{msg}", "{title}", "{dflt}")')
+              '[Microsoft.VisualBasic.Interaction]::InputBox('
+              '[string]$env:AP_MSG, [string]$env:AP_TITLE, [string]$env:AP_DEFAULT)')
     try:
-        cp = _powershell(script, timeout=(req.timeout if req.has_timeout() else None))
+        cp = _powershell(script, timeout=(req.timeout if req.has_timeout() else None),
+                         env={"AP_MSG": req.message, "AP_TITLE": req.title, "AP_DEFAULT": req.default})
     except subprocess.TimeoutExpired:
         return Result("timeout", channel, "ask")
     if cp.returncode != 0:
@@ -332,17 +352,21 @@ def _win_ask(req: Ask, channel: str) -> Result:
 
 
 def _win_confirm(req: Ask, channel: str) -> Result:
-    wait = int(req.timeout) if req.has_timeout() else 0
-    msg, title = req.message.replace('"', "'"), req.title.replace('"', "'")
+    wait = int(req.timeout) if req.has_timeout() else 0   # int we control; safe to interpolate
     # Popup type 36 = Yes/No (4) + question icon (32). Returns 6=Yes, 7=No, -1=timeout.
-    script = f'(New-Object -ComObject WScript.Shell).Popup("{msg}", {wait}, "{title}", 36)'
-    cp = _powershell(script)
+    script = (f'(New-Object -ComObject WScript.Shell).Popup('
+              f'[string]$env:AP_MSG, {wait}, [string]$env:AP_TITLE, 36)')
+    cp = _powershell(script, env={"AP_MSG": req.message, "AP_TITLE": req.title})
+    if cp.returncode != 0:                                  # popup never ran: not a human "no"
+        return Result("error", channel, "confirm", error=(cp.stderr or "").strip() or "powershell failed")
     code = (cp.stdout or "").strip()
     if code == "6":
         return Result("approved", channel, "confirm", response=req.yes)
+    if code == "7":
+        return Result("denied", channel, "confirm", response=req.no)
     if code == "-1":
         return Result("timeout", channel, "confirm")
-    return Result("denied", channel, "confirm", response=req.no)
+    return Result("error", channel, "confirm", error=f"unexpected popup result {code!r}")
 
 
 # Platform -> verb dispatch tables for the system channel.
@@ -367,8 +391,12 @@ def _is_approval(reply: str, yes_label: str) -> bool:
 def _match_choice(reply: str, options: list) -> Optional[str]:
     """Map a human's reply to one option: a 1-based index or the option text."""
     reply = reply.strip()
-    if reply.isdigit() and 1 <= int(reply) <= len(options):
-        return options[int(reply) - 1]
+    # isascii() guards int(): str.isdigit() is True for chars like superscript
+    # digits that int() then rejects with ValueError.
+    if reply.isascii() and reply.isdigit():
+        idx = int(reply)
+        if 1 <= idx <= len(options):
+            return options[idx - 1]
     for opt in options:
         if reply.lower() == opt.lower():
             return opt
@@ -449,16 +477,24 @@ class NtfyChannel(Channel):
         token = self.cfg.get("token")
         return {"Authorization": f"Bearer {token}"} if token else {}
 
-    def _publish(self, body: str, req: Ask) -> None:
+    def _publish(self, body: str, req: Ask) -> Optional[str]:
         headers = dict(self._auth())
         headers["Title"] = NTFY_OUT_PREFIX + req.title
         headers["Priority"] = {"low": "low", "normal": "default", "high": "high"}.get(req.urgency, "default")
         request = urllib.request.Request(f"{self._server()}/{self._topic()}",
                                          data=body.encode("utf-8"), headers=headers, method="POST")
-        urllib.request.urlopen(request, timeout=15).read()
+        raw = urllib.request.urlopen(request, timeout=15).read()
+        try:                              # the message id lets the poller read only replies AFTER this publish
+            return json.loads(raw).get("id")
+        except (ValueError, AttributeError):
+            return None
 
-    def _poll(self, since: float, deadline: float) -> Optional[str]:
-        url = f"{self._server()}/{self._topic()}/json?since={int(since)}"
+    def _poll(self, since, deadline: float) -> Optional[str]:
+        # `since` is our published message id (preferred) or an int unix time -- both are
+        # valid ntfy `since` values. An id makes ntfy return only messages that arrived
+        # strictly AFTER our publish, avoiding the second-granular replay race where a
+        # slightly-earlier reply on the topic is misread as the answer to this prompt.
+        url = f"{self._server()}/{self._topic()}/json?since={urllib.parse.quote(str(since))}"
         while time.time() < deadline:
             try:
                 request = urllib.request.Request(url, headers=self._auth())
@@ -498,9 +534,9 @@ class NtfyChannel(Channel):
 
     def _round_trip(self, body: str, req: Ask) -> Optional[str]:
         start = time.time()
-        self._publish(body, req)
+        msg_id = self._publish(body, req)
         deadline = start + (req.timeout if req.has_timeout() else 86400)
-        return self._poll(start, deadline)
+        return self._poll(msg_id or int(start), deadline)
 
     def ask(self, req: Ask) -> Result:
         body = f"{req.message}\n\nReply to this topic to answer."
@@ -550,8 +586,18 @@ class WebhookChannel(Channel):
             raise Unsupported(f"channel '{self.name}': webhook requires a 'url'")
         template = self.cfg.get("body")
         if template:
-            data = template.format(message=req.message, title=req.title).encode("utf-8")
             content_type = self.cfg.get("content_type", "application/json")
+            # For a JSON body, escape the agent's text so quotes / newlines / backslashes
+            # cannot break the payload or inject sibling fields (e.g. spoof a Slack/Discord
+            # username). json.dumps(x)[1:-1] is the escaped inner string; the {message_json}
+            # / {title_json} placeholders give the fully-quoted form.
+            if "json" in content_type.lower():
+                msg, title = json.dumps(req.message)[1:-1], json.dumps(req.title)[1:-1]
+            else:
+                msg, title = req.message, req.title
+            data = template.format(message=msg, title=title,
+                                   message_json=json.dumps(req.message),
+                                   title_json=json.dumps(req.title)).encode("utf-8")
         else:
             data = json.dumps({"text": f"{req.title}: {req.message}"}).encode("utf-8")
             content_type = "application/json"
@@ -1017,6 +1063,8 @@ def load_config() -> dict:
     if not path.is_file():
         return {"default_channel": "system", "channels": {"system": {"type": "system"}}}
     data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("config root must be a JSON object")
     data.setdefault("default_channel", "system")
     data.setdefault("channels", {}).setdefault("system", {"type": "system"})
     return data
@@ -1298,7 +1346,11 @@ def notify_policy(conf: dict, req: Ask, channel: str) -> Optional[Result]:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    conf = load_config()
+    try:
+        conf = load_config()
+    except (ValueError, OSError) as exc:                    # malformed / unreadable config.json
+        print(f"agentping: cannot read config {config_path()}: {exc}", file=sys.stderr)
+        return EXIT_USAGE
     if args.verb == "doctor":
         return cmd_doctor(conf)
     if args.verb == "setup-logo":
